@@ -1554,6 +1554,7 @@ const backgroundThreadUpdatesKeepTimestamp = Effect.gen(function* () {
   const synced = yield* readActivity;
   assert.deepEqual(synced.updatedAt, createdAt);
   assert.equal(synced.thread.pullRequests?.[0]?.number, 42);
+  assert.deepEqual((yield* store.getThreadsWithPullRequests(threadId))[0]?.updatedAt, createdAt);
 
   const snapshot = {
     state: "open" as const,

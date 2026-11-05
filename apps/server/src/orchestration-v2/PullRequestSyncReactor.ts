@@ -39,11 +39,8 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import { isTerminalRunStatus } from "./ThreadManagementService.ts";
 
 const SLOW_SYNC_INTERVAL_MS = 15 * 60 * 1_000;
-// Every server polls every open linked pull request, and most of them sit untouched for days.
-// One nobody has updated for QUIET_AFTER_MS is read on the quiet cadence instead of each sweep;
-// requested refreshes, watches and a host CLI's merge command still read it at once.
-const QUIET_AFTER_MS = 30 * 60 * 1_000;
-const QUIET_SYNC_INTERVAL_MS = 5 * 60 * 1_000;
+const RECENT_THREAD_ACTIVITY_MS = 2 * 60 * 60 * 1_000;
+const INACTIVE_SYNC_INTERVAL_MS = 60 * 60 * 1_000;
 // A pull request closed this long ago is rarely reopened, so the sweep stops reading it, as it
 // does merged ones. A reader that sees it open, or a requested refresh, still reads it at once.
 const CLOSED_FINAL_AFTER_MS = 24 * 60 * 60 * 1_000;
@@ -338,7 +335,7 @@ export const make = Effect.gen(function* () {
   const git = yield* GitManager.GitManager;
   const random = yield* SecureRandom.SecureRandom;
 
-  const lastSyncedAt = new Map<string, number>();
+  const lastReadAt = new Map<string, number>();
   const requested = new Set<string>();
   // Requests arriving during a host read wait for the next sweep.
   const pendingRequests = new Set<string>();
@@ -350,9 +347,16 @@ export const make = Effect.gen(function* () {
   const pausedUntil = new Map<string, number>();
 
   const isDue = (key: string, entries: ReadonlyArray<LinkEntry>, nowMs: number): boolean => {
-    if (requested.has(key) || retryStacks.has(key)) return true;
-    if (entries.some((entry) => entry.link.snapshot === null)) return true;
+    if (requested.has(key)) return true;
     const active = entries.filter((entry) => isUnsettled(entry.thread));
+    const last = lastReadAt.get(key);
+    const sinceLastMs = last === undefined ? Number.POSITIVE_INFINITY : nowMs - last;
+    const recentlyActive = active.some(
+      (entry) => nowMs - DateTime.toEpochMillis(entry.thread.updatedAt) < RECENT_THREAD_ACTIVITY_MS,
+    );
+    if (!recentlyActive && sinceLastMs < INACTIVE_SYNC_INTERVAL_MS) return false;
+    if (retryStacks.has(key)) return true;
+    if (entries.some((entry) => entry.link.snapshot === null)) return true;
     // Merged snapshots without mergedAt cannot settle threads; reread slowly until supplied.
     const isFinal = ({ link: { snapshot } }: LinkEntry) =>
       snapshot?.state === "merged"
@@ -360,16 +364,8 @@ export const make = Effect.gen(function* () {
         : snapshot?.state === "closed" &&
           nowMs - Date.parse(snapshot.closedAt ?? "") >= CLOSED_FINAL_AFTER_MS;
     if (active.every(isFinal)) return false;
-    const last = lastSyncedAt.get(key);
-    const sinceLastMs = last === undefined ? Number.POSITIVE_INFINITY : nowMs - last;
     const open = active.filter((entry) => entry.link.snapshot?.state === "open");
-    if (open.length > 0) {
-      const quiet = open.every((entry) => {
-        const updatedAt = entry.link.snapshot?.updatedAt;
-        return updatedAt != null && nowMs - Date.parse(updatedAt) >= QUIET_AFTER_MS;
-      });
-      return !quiet || sinceLastMs >= QUIET_SYNC_INTERVAL_MS;
-    }
+    if (open.length > 0) return true;
     return sinceLastMs >= SLOW_SYNC_INTERVAL_MS;
   };
 
@@ -401,7 +397,7 @@ export const make = Effect.gen(function* () {
     }
     pendingRequests.clear();
 
-    for (const key of lastSyncedAt.keys()) if (!groups.has(key)) lastSyncedAt.delete(key);
+    for (const key of lastReadAt.keys()) if (!groups.has(key)) lastReadAt.delete(key);
     for (const key of retryStacks) if (!groups.has(key)) retryStacks.delete(key);
     for (const key of requested.keys()) if (!groups.has(key)) requested.delete(key);
 
@@ -560,8 +556,6 @@ export const make = Effect.gen(function* () {
           }
         }
       }
-      // The host answered, so the cadence clock ticks even if a dispatch below is rejected.
-      lastSyncedAt.set(key, nowMs);
       requested.delete(key);
       yield* Effect.forEach(
         entries,
@@ -605,11 +599,12 @@ export const make = Effect.gen(function* () {
         const pauseKey = `${first.thread.projectId}\0${normalizeThreadPullRequestKey(first.link).host}`;
         // Check pauses at each read so changes during the sweep apply immediately.
         return Clock.currentTimeMillis.pipe(
-          Effect.flatMap((startedAtMs) =>
-            (pausedUntil.get(pauseKey) ?? 0) > startedAtMs
-              ? Effect.void
-              : readGroup(key, entries, pauseKey),
-          ),
+          Effect.flatMap((startedAtMs) => {
+            if ((pausedUntil.get(pauseKey) ?? 0) > startedAtMs) return Effect.void;
+            // Failed reads still consume quota and must respect the inactive cadence.
+            lastReadAt.set(key, startedAtMs);
+            return readGroup(key, entries, pauseKey);
+          }),
         );
       },
       // Match summary batch width so GitHub reads coalesce into one request.
@@ -727,7 +722,7 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* worker.enqueue("all");
         yield* worker.drain;
-      }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.asVoid),
+      }).pipe(Effect.repeat(Schedule.spaced("5 minutes")), Effect.asVoid),
     );
   });
 
