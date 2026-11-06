@@ -46,6 +46,11 @@ import type { PullRequestTestThread } from "./testkit/pullRequestFixtures.ts";
 const NOW = "2026-08-28T12:00:00.000Z";
 const PROJECT_ID = ProjectId.make("sync-project");
 
+type SyncTestThread = PullRequestTestThread & {
+  readonly activityAt: string;
+  readonly hasActiveRun: boolean;
+};
+
 type SyncCommand = Extract<
   OrchestrationCommand,
   { readonly type: "thread.pull-request-link.sync" }
@@ -66,10 +71,7 @@ function makeProject(id: ProjectId = PROJECT_ID): OrchestrationProjectShell {
   };
 }
 
-function makeThread(
-  id: string,
-  overrides: Partial<PullRequestTestThread> = {},
-): PullRequestTestThread {
+function makeThread(id: string, overrides: Partial<SyncTestThread> = {}): SyncTestThread {
   return {
     id: ThreadId.make(id),
     projectId: PROJECT_ID,
@@ -85,6 +87,8 @@ function makeThread(
     pullRequests: [],
     createdAt: "2026-08-01T00:00:00.000Z",
     updatedAt: NOW,
+    activityAt: overrides.updatedAt ?? NOW,
+    hasActiveRun: false,
     archivedAt: null,
     settledOverride: null,
     settledAt: null,
@@ -126,12 +130,12 @@ function makeLink(
 interface TestShellSnapshot {
   readonly snapshotSequence: number;
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
-  readonly threads: ReadonlyArray<PullRequestTestThread>;
+  readonly threads: ReadonlyArray<SyncTestThread>;
   readonly updatedAt: string;
 }
 
 function makeSnapshot(
-  threads: ReadonlyArray<PullRequestTestThread>,
+  threads: ReadonlyArray<SyncTestThread>,
   snapshotSequence = 1,
 ): TestShellSnapshot {
   return {
@@ -244,6 +248,8 @@ const makeHarness = Effect.fn("makePullRequestSyncHarness")(function* (options: 
                 id: thread.id,
                 projectId: thread.projectId,
                 updatedAt: DateTime.makeUnsafe(thread.updatedAt),
+                activityAt: DateTime.makeUnsafe(thread.activityAt),
+                hasActiveRun: thread.hasActiveRun,
                 lineage: {
                   parentThreadId: null,
                   relationshipToParent: null,
@@ -842,9 +848,16 @@ describe("PullRequestSyncReactor", () => {
                 updatedAt: "2026-08-28T10:05:00.000Z",
                 pullRequests: [makeLink(7, {})],
               }),
-              makeThread("idle", { updatedAt: idleAt, pullRequests: [makeLink(8, {})] }),
+              makeThread("idle", {
+                activityAt: idleAt,
+                pullRequests: [makeLink(8, {})],
+              }),
               makeThread("shared-idle", { updatedAt: idleAt, pullRequests: [makeLink(9, {})] }),
-              makeThread("shared-active", { pullRequests: [makeLink(9, {})] }),
+              makeThread("shared-active", {
+                activityAt: idleAt,
+                hasActiveRun: true,
+                pullRequests: [makeLink(9, {})],
+              }),
               makeThread("settled", {
                 settledOverride: "settled",
                 pullRequests: [makeLink(8, {})],
@@ -880,7 +893,7 @@ describe("PullRequestSyncReactor", () => {
               ...snapshot,
               threads: snapshot.threads.map((thread) =>
                 thread.id === "idle"
-                  ? { ...thread, updatedAt: "2026-08-28T13:00:00.000Z" }
+                  ? { ...thread, activityAt: "2026-08-28T13:00:00.000Z" }
                   : thread,
               ),
             }));

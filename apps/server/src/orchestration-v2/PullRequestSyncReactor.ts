@@ -352,7 +352,9 @@ export const make = Effect.gen(function* () {
     const last = lastReadAt.get(key);
     const sinceLastMs = last === undefined ? Number.POSITIVE_INFINITY : nowMs - last;
     const recentlyActive = active.some(
-      (entry) => nowMs - DateTime.toEpochMillis(entry.thread.updatedAt) < RECENT_THREAD_ACTIVITY_MS,
+      (entry) =>
+        entry.thread.hasActiveRun ||
+        nowMs - DateTime.toEpochMillis(entry.thread.activityAt) < RECENT_THREAD_ACTIVITY_MS,
     );
     if (!recentlyActive && sinceLastMs < INACTIVE_SYNC_INTERVAL_MS) return false;
     if (retryStacks.has(key)) return true;

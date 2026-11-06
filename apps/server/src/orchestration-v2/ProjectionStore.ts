@@ -190,7 +190,7 @@ export type ProjectionLimitRecoveryCandidate = Pick<
 export type ProjectionThreadPullRequests = Pick<
   OrchestrationV2AppThread,
   "id" | "projectId" | "lineage" | "settledOverride" | "settledAt" | "pullRequests" | "updatedAt"
->;
+> & { readonly activityAt: DateTime.Utc; readonly hasActiveRun: boolean };
 
 export type ProjectionSettlementCandidate = Pick<
   OrchestrationV2ThreadShell,
@@ -6676,13 +6676,42 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const getThreadsWithPullRequests: ProjectionStoreV2Shape["getThreadsWithPullRequests"] =
       Effect.fn("ProjectionStore.getThreadsWithPullRequests")(
         function* (threadId) {
-          const rows = yield* sql<PayloadRow>`
-          SELECT payload_json
-          FROM orchestration_v2_projection_threads
-          WHERE deleted_at IS NULL${threadId === undefined ? sql`` : sql` AND thread_id = ${threadId}`}
-            AND json_extract(payload_json, '$.archivedAt') IS NULL
-            AND json_array_length(payload_json, '$.pullRequests') > 0
-          ORDER BY updated_at ASC, thread_id ASC
+          const rows = yield* sql<
+            PayloadRow & { readonly activity_at: string; readonly has_active_run: number }
+          >`
+          SELECT t.payload_json,
+            MAX(
+              t.created_at,
+              COALESCE(r.requested_at, t.created_at),
+              COALESCE(r.completed_at, t.created_at),
+              COALESCE((
+                SELECT message.updated_at
+                FROM orchestration_v2_projection_messages message
+                WHERE message.thread_id = t.thread_id AND message.role = 'user'
+                  AND json_extract(message.payload_json, '$.createdBy') = 'user'
+                  AND NOT ${isIdleCompactionMessage("message")}
+                ORDER BY message.updated_at DESC, message.message_id DESC
+                LIMIT 1
+              ), t.created_at)
+            ) AS activity_at,
+            EXISTS (
+              SELECT 1 FROM orchestration_v2_projection_runs active
+              WHERE active.thread_id = t.thread_id
+                AND active.status IN ('preparing', 'starting', 'running', 'waiting')
+                AND NOT ${isSilentShellRun("active")}
+            ) AS has_active_run
+          FROM orchestration_v2_projection_threads t
+          LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = (
+            SELECT latest.run_id FROM orchestration_v2_projection_runs latest
+            WHERE latest.thread_id = t.thread_id
+              AND NOT ${isSilentShellRun("latest")}
+            ORDER BY latest.ordinal DESC, latest.run_id DESC
+            LIMIT 1
+          )
+          WHERE t.deleted_at IS NULL${threadId === undefined ? sql`` : sql` AND t.thread_id = ${threadId}`}
+            AND json_extract(t.payload_json, '$.archivedAt') IS NULL
+            AND json_array_length(t.payload_json, '$.pullRequests') > 0
+          ORDER BY t.updated_at ASC, t.thread_id ASC
         `;
           return yield* Effect.forEach(rows, (row) =>
             decodeThreadPayload(row.payload_json).pipe(
@@ -6694,6 +6723,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 settledAt: thread.settledAt,
                 pullRequests: thread.pullRequests ?? [],
                 updatedAt: thread.updatedAt,
+                activityAt: DateTime.makeUnsafe(row.activity_at),
+                hasActiveRun: row.has_active_run === 1,
               })),
             ),
           );

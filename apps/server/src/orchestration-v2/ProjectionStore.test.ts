@@ -1598,6 +1598,143 @@ const backgroundThreadUpdatesKeepTimestamp = Effect.gen(function* () {
     payload: { ...reordered.thread, pinnedAt: null, pinOrderKey: null },
   });
   yield* readActivity;
+
+  const providerAt = DateTime.add(createdAt, { hours: 3 });
+  yield* store.apply({
+    id: EventId.make("event:background-updates:shared-session"),
+    type: "provider-session.updated",
+    threadId,
+    occurredAt: providerAt,
+    payload: {
+      id: ProviderSessionId.make("session:background-updates:shared"),
+      driver,
+      providerInstanceId,
+      status: "stopped",
+      cwd: "/workspace/project",
+      model: modelSelection.model,
+      capabilities: CodexProviderCapabilitiesV2,
+      createdAt,
+      updatedAt: providerAt,
+      lastError: null,
+    },
+  });
+  assert.deepEqual((yield* store.getThread(threadId)).updatedAt, providerAt);
+  assert.deepEqual((yield* store.getThreadsWithPullRequests(threadId))[0]?.activityAt, createdAt);
+
+  const messageAt = DateTime.add(providerAt, { minutes: 1 });
+  const messageId = MessageId.make("message:background-updates:user");
+  yield* store.apply({
+    id: EventId.make("event:background-updates:user-message"),
+    type: "message.updated",
+    threadId,
+    occurredAt: messageAt,
+    payload: {
+      id: messageId,
+      threadId,
+      runId: null,
+      nodeId: null,
+      role: "user",
+      createdBy: "user",
+      creationSource: "web",
+      text: "Continue",
+      attachments: [],
+      streaming: false,
+      createdAt: messageAt,
+      updatedAt: messageAt,
+    },
+  });
+  assert.deepEqual((yield* store.getThreadsWithPullRequests(threadId))[0]?.activityAt, messageAt);
+
+  const requestedAt = DateTime.add(messageAt, { minutes: 1 });
+  const runId = RunId.make("run:background-updates");
+  const run = {
+    id: runId,
+    threadId,
+    ordinal: 1,
+    providerInstanceId,
+    modelSelection,
+    providerThreadId: null,
+    userMessageId: messageId,
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "running" as const,
+    requestedAt,
+    startedAt: requestedAt,
+    completedAt: null,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  yield* store.apply({
+    id: EventId.make("event:background-updates:run"),
+    type: "run.created",
+    threadId,
+    occurredAt: requestedAt,
+    payload: run,
+  });
+  assert.deepEqual((yield* store.getThreadsWithPullRequests(threadId))[0]?.activityAt, requestedAt);
+  assert.isTrue((yield* store.getThreadsWithPullRequests(threadId))[0]?.hasActiveRun);
+
+  const completedAt = DateTime.add(requestedAt, { hours: 1 });
+  yield* store.apply({
+    id: EventId.make("event:background-updates:run-completed"),
+    type: "run.updated",
+    threadId,
+    occurredAt: completedAt,
+    payload: { ...run, status: "completed", completedAt },
+  });
+  assert.deepEqual((yield* store.getThreadsWithPullRequests(threadId))[0]?.activityAt, completedAt);
+  assert.isFalse((yield* store.getThreadsWithPullRequests(threadId))[0]?.hasActiveRun);
+
+  for (const [createdBy, creationSource, idleCompaction] of [
+    ["agent", "server", undefined],
+    ["user", "web", "onReturn"],
+  ] as const) {
+    const compactAt = DateTime.add(completedAt, { hours: 1 });
+    const compactMessageId = MessageId.make(`message:background-updates:compact:${createdBy}`);
+    const compactRunId = RunId.make(`run:background-updates:compact:${createdBy}`);
+    yield* store.apply({
+      id: EventId.make(`event:background-updates:compact-message:${createdBy}`),
+      type: "message.updated",
+      threadId,
+      occurredAt: compactAt,
+      payload: {
+        id: compactMessageId,
+        threadId,
+        runId: compactRunId,
+        nodeId: null,
+        role: "user",
+        createdBy,
+        creationSource,
+        ...(idleCompaction === undefined ? {} : { idleCompaction }),
+        text: "/compact",
+        attachments: [],
+        streaming: false,
+        createdAt: compactAt,
+        updatedAt: compactAt,
+      },
+    });
+    yield* store.apply({
+      id: EventId.make(`event:background-updates:compact-run:${createdBy}`),
+      type: "run.created",
+      threadId,
+      occurredAt: compactAt,
+      payload: {
+        ...run,
+        id: compactRunId,
+        userMessageId: compactMessageId,
+        ordinal: createdBy === "agent" ? 2 : 3,
+        status: "running",
+        requestedAt: compactAt,
+        startedAt: compactAt,
+        completedAt: null,
+      },
+    });
+    assert.deepEqual(
+      (yield* store.getThreadsWithPullRequests(threadId))[0]?.activityAt,
+      completedAt,
+    );
+    assert.isFalse((yield* store.getThreadsWithPullRequests(threadId))[0]?.hasActiveRun);
+  }
 });
 
 it.effect("SQL projection keeps background thread updates out of updatedAt", () =>
