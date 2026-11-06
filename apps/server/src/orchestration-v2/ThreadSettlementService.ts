@@ -44,6 +44,9 @@ export interface SettlementPullRequest {
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
+const BRANCH_DISCOVERY_INTERVAL_MS = 5 * 60 * 1_000;
+const QUIET_BRANCH_DISCOVERY_INTERVAL_MS = 60 * 60 * 1_000;
+const BRANCH_DISCOVERY_QUIET_AFTER_MS = 2 * 60 * 60 * 1_000;
 
 function toMillis(value: DateTime.Utc | null | undefined): number | null {
   return value == null ? null : DateTime.toEpochMillis(value);
@@ -313,17 +316,22 @@ export const make = Effect.gen(function* () {
   const projectScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();
+  const branchDiscoveryChecks = new Map<string, { checkedAtMs: number; activityAtMs: number }>();
 
   const sweep = Effect.fn("ThreadSettlementServiceV2.sweep")(function* (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
     threadId?: ThreadId,
+    forceBranchDiscovery = false,
   ) {
     const settings = yield* settingsService.getSettings;
     if (!autoSettlementConfigured(settings)) {
       return;
     }
     const threads = yield* projections.getSettlementCandidates(threadId);
-    if (threads.length === 0) return;
+    if (threads.length === 0) {
+      if (threadId === undefined) branchDiscoveryChecks.clear();
+      return;
+    }
     const projectShells = yield* projectStore.listShells();
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const projects = new Map(projectShells.map((project) => [project.id, project]));
@@ -444,6 +452,11 @@ export const make = Effect.gen(function* () {
       );
     };
     const groups = Map.groupBy(lookupCandidates, lookupKey);
+    if (threadId === undefined) {
+      for (const key of branchDiscoveryChecks.keys()) {
+        if (!groups.has(key)) branchDiscoveryChecks.delete(key);
+      }
+    }
 
     // wouldSettle and pullRequestFor run per lookup group; the git and pull request reads they make carry the spans.
     const wouldSettle = Effect.fnUntraced(function* (
@@ -525,6 +538,33 @@ export const make = Effect.gen(function* () {
         return yield* Effect.die(new Error("thread project not found"));
       }
       const refresh = group.filter((member) => shellClosedThreads.delete(member.id)).length > 0;
+      const key = lookupKey(thread);
+      const activityAtMs = latestMillis(
+        group.flatMap((member) => [
+          toMillis(member.createdAt),
+          toMillis(member.latestUserAuthoredMessageAt),
+          toMillis(member.latestRunCompletedAt),
+        ]),
+      )!;
+      const lastCheck = branchDiscoveryChecks.get(key);
+      const intervalMs =
+        nowMs - activityAtMs >= BRANCH_DISCOVERY_QUIET_AFTER_MS
+          ? QUIET_BRANCH_DISCOVERY_INTERVAL_MS
+          : BRANCH_DISCOVERY_INTERVAL_MS;
+      // Event-driven checks stay immediate; only periodic discovery backs off.
+      if (
+        !forceBranchDiscovery &&
+        mergedPullRequest === null &&
+        threadId === undefined &&
+        !refresh &&
+        lastCheck !== undefined &&
+        activityAtMs <= lastCheck.activityAtMs &&
+        nowMs - lastCheck.checkedAtMs < intervalMs
+      ) {
+        return undefined;
+      }
+      // Failed lookups still consume host quota, so they share the same backoff.
+      branchDiscoveryChecks.set(key, { checkedAtMs: nowMs, activityAtMs });
       return yield* git.branchPullRequest({ cwd, branch: thread.branch }, { refresh });
     });
 
@@ -554,8 +594,9 @@ export const make = Effect.gen(function* () {
   const runSweep = (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
     threadId?: ThreadId,
+    forceBranchDiscovery = false,
   ) =>
-    sweep(mergedPullRequest, threadId).pipe(
+    sweep(mergedPullRequest, threadId, forceBranchDiscovery).pipe(
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
         (cause) =>
@@ -566,7 +607,9 @@ export const make = Effect.gen(function* () {
     );
   // A thread that just stopped must not wait behind a full sweep or another thread's host
   // reads: clients hold it in Working only briefly, so a late settle makes it appear and then vanish.
-  const fullSweeps = yield* makeDrainableWorker(() => runSweep(null));
+  const fullSweeps = yield* makeDrainableWorker((forceBranchDiscovery: boolean) =>
+    runSweep(null, undefined, forceBranchDiscovery),
+  );
   const threadSweeps = yield* FiberSet.make<void>();
   const threadSweepSlots = yield* Semaphore.make(8);
   // One sweep per thread at a time; events during a running sweep coalesce into one more pass.
@@ -690,7 +733,7 @@ export const make = Effect.gen(function* () {
     let lastSettlementSettings = autoSettlementSettingsKey(initialSettings);
     yield* forkParked(
       Effect.gen(function* () {
-        yield* fullSweeps.enqueue(undefined);
+        yield* fullSweeps.enqueue(false);
         yield* fullSweeps.drain;
       }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.asVoid),
     );
@@ -701,7 +744,7 @@ export const make = Effect.gen(function* () {
           return Effect.void;
         }
         lastSettlementSettings = key;
-        return fullSweeps.enqueue(undefined);
+        return fullSweeps.enqueue(true);
       }),
     );
     yield* forkParked(Stream.runForEach(mergedPullRequests, (event) => runSweep(event)));

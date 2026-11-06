@@ -762,6 +762,89 @@ const startHarness = Effect.fn("startThreadSettlementHarness")(function* (
 });
 
 describe("ThreadSettlementServiceV2 worker", () => {
+  it.effect.each(["missing", "open", "failed"] as const)(
+    "backs off branch discovery after two hours of thread inactivity (%s)",
+    (state) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const nowMs = Date.parse(NOW);
+          const minute = 60 * 1_000;
+          yield* TestClock.setTime(nowMs);
+          const active = makeThread("active", {
+            branch: "active-feature",
+            ...(state === "missing"
+              ? { latestUserAuthoredMessageAt: DateTime.makeUnsafe(nowMs - 110 * minute) }
+              : { latestRunCompletedAt: DateTime.makeUnsafe(nowMs - 110 * minute) }),
+          });
+          const dormant = makeThread("dormant", {
+            branch: "dormant-feature",
+            updatedAt: DateTime.makeUnsafe(NOW),
+          });
+          const sharing = makeThread("sharing", { branch: active.branch });
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([sharing, active, dormant]),
+            settings: { ...DEFAULT_SERVER_SETTINGS, sidebarAutoSettleAfterDays: null },
+            branchPullRequest: () =>
+              state === "failed"
+                ? Effect.die(new Error("branch discovery unavailable"))
+                : Effect.succeed(state === "missing" ? null : makeBranchPullRequest(state)),
+          });
+
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            const counts = Effect.map(Ref.get(fixture.branchCalls), (calls) => [
+              calls.filter((call) => call.branch === active.branch).length,
+              calls.filter((call) => call.branch === dormant.branch).length,
+            ]);
+            assert.deepEqual(yield* counts, [1, 1]);
+
+            yield* TestClock.adjust("1 minute");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [1, 1]);
+            yield* TestClock.adjust("4 minutes");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [2, 1]);
+
+            yield* TestClock.adjust("5 minutes");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [2, 1]);
+            yield* TestClock.adjust("49 minutes");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [2, 1]);
+            yield* TestClock.adjust("1 minute");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [2, 2]);
+            yield* TestClock.adjust("5 minutes");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [3, 2]);
+
+            yield* Ref.set(
+              fixture.snapshots,
+              makeSnapshot([
+                sharing,
+                active,
+                {
+                  ...dormant,
+                  latestUserAuthoredMessageAt: DateTime.makeUnsafe(nowMs + 65 * minute),
+                },
+              ]),
+            );
+            yield* TestClock.adjust("1 minute");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [3, 3]);
+            yield* TestClock.adjust("4 minutes");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [3, 3]);
+            yield* TestClock.adjust("1 minute");
+            yield* service.drain;
+            assert.deepEqual(yield* counts, [3, 4]);
+            assert.deepEqual(yield* Ref.get(fixture.commands), []);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
+  );
+
   it.effect("skips settings and PR decisions for recent branchless threads", () =>
     Effect.scoped(
       Effect.gen(function* () {
