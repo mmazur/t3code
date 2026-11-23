@@ -7,8 +7,11 @@ const RECHECKS_PER_SWEEP = 4;
  * Schedules a sweep's branch lookups, so their git work does not grow with the number of idle
  * threads. GitManager's caches cannot: they expire in minutes and evict past a few thousand branches.
  */
-export function makeNoPullRequestRechecks() {
-  const reads = new Map<string, { readonly readAtMs: number; readonly found: boolean }>();
+export function makeNoPullRequestRechecks(branchCadence?: (idleMs: number) => number) {
+  const reads = new Map<
+    string,
+    { readonly readAtMs: number; readonly found: boolean; readonly activityAtMs: number }
+  >();
   return {
     /**
      * The branches a scheduled sweep looks up now: every one that last had a pull request, and
@@ -22,15 +25,24 @@ export function makeNoPullRequestRechecks() {
       const due: Array<{ key: string; activityAtMs: number; readAtMs: number }> = [];
       for (const branch of branches) {
         const read = reads.get(branch.key);
+        if (branchCadence === undefined && read?.found === true) {
+          selected.add(branch.key);
+          continue;
+        }
+        const idleMs = nowMs - branch.activityAtMs;
+        const delayMs =
+          branchCadence?.(idleMs) ??
+          Math.min(Math.max(idleMs / RECHECK_IDLE_DIVISOR, RECHECK_MIN_MS), RECHECK_MAX_MS);
+        if (
+          read !== undefined &&
+          (branchCadence === undefined || branch.activityAtMs <= read.activityAtMs) &&
+          nowMs - read.readAtMs < delayMs
+        )
+          continue;
         if (read?.found === true) {
           selected.add(branch.key);
           continue;
         }
-        const delayMs = Math.min(
-          Math.max((nowMs - branch.activityAtMs) / RECHECK_IDLE_DIVISOR, RECHECK_MIN_MS),
-          RECHECK_MAX_MS,
-        );
-        if (read !== undefined && nowMs - read.readAtMs < delayMs) continue;
         due.push({ ...branch, readAtMs: read?.readAtMs ?? Number.NEGATIVE_INFINITY });
       }
       due.sort((left, right) =>
@@ -39,14 +51,14 @@ export function makeNoPullRequestRechecks() {
           : left.readAtMs - right.readAtMs,
       );
       // Stamped before the lookup, so one that keeps failing cannot hold a place in every sweep.
-      for (const { key } of due.slice(0, RECHECKS_PER_SWEEP)) {
+      for (const { key, activityAtMs } of due.slice(0, RECHECKS_PER_SWEEP)) {
         selected.add(key);
-        reads.set(key, { readAtMs: nowMs, found: false });
+        reads.set(key, { readAtMs: nowMs, found: false, activityAtMs });
       }
       return selected;
     },
-    record: (key: string, nowMs: number, found: boolean): void => {
-      reads.set(key, { readAtMs: nowMs, found });
+    record: (key: string, nowMs: number, found: boolean, activityAtMs = 0): void => {
+      reads.set(key, { readAtMs: nowMs, found, activityAtMs });
     },
     retain: (keys: { readonly has: (key: string) => boolean }): void => {
       for (const key of reads.keys()) {
