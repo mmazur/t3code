@@ -49,6 +49,8 @@ const SLOW_SYNC_INTERVAL_MS = 15 * 60 * 1_000;
 // requested refreshes, watches and a host CLI's merge command still read it at once.
 export const QUIET_AFTER_MS = 30 * 60 * 1_000;
 export const QUIET_SYNC_INTERVAL_MS = 5 * 60 * 1_000;
+const RECENT_THREAD_ACTIVITY_MS = 2 * 60 * 60 * 1_000;
+const INACTIVE_SYNC_INTERVAL_MS = 60 * 60 * 1_000;
 // A pull request closed this long ago is rarely reopened, so the sweep stops reading it, as it
 // does merged ones. A reader that sees it open, or a requested refresh, still reads it at once.
 const CLOSED_FINAL_AFTER_MS = 24 * 60 * 60 * 1_000;
@@ -363,6 +365,7 @@ export const make = Effect.gen(function* () {
   const random = yield* SecureRandom.SecureRandom;
 
   const lastSyncedAt = new Map<string, number>();
+  const lastReadAt = new Map<string, number>();
   const requested = new Set<string>();
   // Requests arriving during a host read wait for the next sweep.
   const pendingRequests = new Set<string>();
@@ -382,6 +385,14 @@ export const make = Effect.gen(function* () {
     if (requested.has(key)) return true;
     const active = entries.filter((entry) => isUnsettled(entry.thread));
     if (active.length === 0) return false;
+    const lastRead = lastReadAt.get(key);
+    const sinceReadMs = lastRead === undefined ? Number.POSITIVE_INFINITY : nowMs - lastRead;
+    const recentlyActive = active.some(
+      ({ thread }) =>
+        thread.hasActiveRun ||
+        nowMs - DateTime.toEpochMillis(thread.activityAt) < RECENT_THREAD_ACTIVITY_MS,
+    );
+    if (!recentlyActive && sinceReadMs < INACTIVE_SYNC_INTERVAL_MS) return false;
     const last = lastSyncedAt.get(key);
     const sinceLastMs = last === undefined ? Number.POSITIVE_INFINITY : nowMs - last;
     if (missing.has(key)) return sinceLastMs >= SLOW_SYNC_INTERVAL_MS;
@@ -393,13 +404,8 @@ export const make = Effect.gen(function* () {
         : snapshot?.state === "closed" &&
           nowMs - Date.parse(snapshot.closedAt ?? "") >= CLOSED_FINAL_AFTER_MS;
     if (active.every(isFinal)) return false;
-    const open = active.filter((entry) => entry.link.snapshot?.state === "open");
-    if (open.length > 0) {
-      const quiet = open.every((entry) => {
-        const updatedAt = entry.link.snapshot?.updatedAt;
-        return updatedAt != null && nowMs - Date.parse(updatedAt) >= QUIET_AFTER_MS;
-      });
-      return !quiet || sinceLastMs >= QUIET_SYNC_INTERVAL_MS;
+    if (active.some((entry) => entry.link.snapshot?.state === "open")) {
+      return sinceReadMs >= QUIET_SYNC_INTERVAL_MS;
     }
     return sinceLastMs >= SLOW_SYNC_INTERVAL_MS;
   };
@@ -437,6 +443,7 @@ export const make = Effect.gen(function* () {
     pendingRequests.clear();
 
     for (const key of lastSyncedAt.keys()) if (!groups.has(key)) lastSyncedAt.delete(key);
+    for (const key of lastReadAt.keys()) if (!groups.has(key)) lastReadAt.delete(key);
     for (const key of retryStacks) if (!groups.has(key)) retryStacks.delete(key);
     for (const key of failedReads.keys()) if (!groups.has(key)) failedReads.delete(key);
     for (const key of missing) if (!groups.has(key)) missing.delete(key);
@@ -668,9 +675,11 @@ export const make = Effect.gen(function* () {
         Effect.suspend(() =>
           isDue(key, entries, nowMs)
             ? Clock.currentTimeMillis.pipe(
-                Effect.flatMap((startedAtMs) =>
-                  isPaused(pauseKey, startedAtMs) ? Effect.void : readGroup(key, entries, pauseKey),
-                ),
+                Effect.flatMap((startedAtMs) => {
+                  if (isPaused(pauseKey, startedAtMs)) return Effect.void;
+                  lastReadAt.set(key, startedAtMs);
+                  return readGroup(key, entries, pauseKey);
+                }),
               )
             : Effect.void,
         ),

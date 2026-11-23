@@ -64,6 +64,11 @@ type ChecksReopenCommand = Extract<
 
 const testCrypto = SecureRandom.make((size) => new Uint8Array(size).fill(1));
 
+type PollingThread = PullRequestTestThread & {
+  readonly activityAt?: string;
+  readonly hasActiveRun?: boolean;
+};
+
 function makeProject(id: ProjectId = PROJECT_ID): OrchestrationProjectShell {
   return {
     id,
@@ -76,10 +81,7 @@ function makeProject(id: ProjectId = PROJECT_ID): OrchestrationProjectShell {
   };
 }
 
-function makeThread(
-  id: string,
-  overrides: Partial<PullRequestTestThread> = {},
-): PullRequestTestThread {
+function makeThread(id: string, overrides: Partial<PollingThread> = {}): PollingThread {
   return {
     id: ThreadId.make(id),
     projectId: PROJECT_ID,
@@ -136,12 +138,12 @@ function makeLink(
 interface TestShellSnapshot {
   readonly snapshotSequence: number;
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
-  readonly threads: ReadonlyArray<PullRequestTestThread>;
+  readonly threads: ReadonlyArray<PollingThread>;
   readonly updatedAt: string;
 }
 
 function makeSnapshot(
-  threads: ReadonlyArray<PullRequestTestThread>,
+  threads: ReadonlyArray<PollingThread>,
   snapshotSequence = 1,
 ): TestShellSnapshot {
   return {
@@ -277,6 +279,8 @@ const makeHarness = Effect.fn("makePullRequestSyncHarness")(function* (options: 
                 settledOverride: thread.settledOverride,
                 settledAt: thread.settledAt === null ? null : DateTime.makeUnsafe(thread.settledAt),
                 pullRequests: thread.pullRequests,
+                activityAt: DateTime.makeUnsafe(thread.activityAt ?? NOW),
+                hasActiveRun: thread.hasActiveRun ?? false,
               })),
           ),
         ),
@@ -860,11 +864,42 @@ describe("PullRequestSyncReactor", () => {
         assert.strictEqual(firstSweep.length, 1);
         yield* Ref.update(fixture.snapshots, (snapshot) => applySync(snapshot, firstSweep));
 
+        yield* sweepFor(fixture, reactor, 4);
+        assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
         yield* sweepAgain(fixture, reactor);
 
         assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
         assert.strictEqual((yield* Ref.get(fixture.stackCalls)).length, 1);
         assert.strictEqual((yield* Ref.get(fixture.syncCommands)).length, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    }),
+  );
+
+  it.effect("polls inactive linked PRs hourly unless an unsettled sibling is still working", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse(NOW));
+      const idle = { activityAt: "2026-08-20T00:00:00.000Z", updatedAt: NOW };
+      const fixture = yield* makeHarness({
+        snapshot: makeSnapshot([
+          makeThread("idle", { ...idle, pullRequests: [makeLink(7, {}), makeLink(8, {})] }),
+          makeThread("working", { ...idle, hasActiveRun: true, pullRequests: [makeLink(8, {})] }),
+        ]),
+        summary: (input) => Effect.succeed(makeSummary(input, { updatedAt: NOW })),
+      });
+      yield* Effect.gen(function* () {
+        const reactor = yield* startAndSweep(fixture);
+        const counts = Ref.get(fixture.summaryCalls).pipe(
+          Effect.map((calls) =>
+            [7, 8].map((id) => calls.filter(({ number }) => number === id).length),
+          ),
+        );
+        assert.deepStrictEqual(yield* counts, [1, 1]);
+        yield* sweepFor(fixture, reactor, 5);
+        assert.deepStrictEqual(yield* counts, [1, 2]);
+        yield* sweepFor(fixture, reactor, 54);
+        assert.deepStrictEqual(yield* counts, [1, 12]);
+        yield* sweepAgain(fixture, reactor);
+        assert.deepStrictEqual(yield* counts, [2, 13]);
       }).pipe(Effect.provide(fixture.layer));
     }),
   );
@@ -1670,6 +1705,15 @@ describe("PullRequestSyncReactor", () => {
         // reads #83 for the first time while #18's summary is still in flight.
         stack.grow();
         yield* linkPullRequest83(fixture);
+        yield* Ref.update(fixture.snapshots, (snapshot) => ({
+          ...snapshot,
+          threads: snapshot.threads.map((thread) => ({
+            ...thread,
+            pullRequests: thread.pullRequests.map((link) =>
+              link.number === 18 ? { ...link, snapshot: null } : link,
+            ),
+          })),
+        }));
         holdSummary = true;
         const invalidatedBefore = stack.invalidated.length;
         yield* TestClock.adjust("30 seconds");
